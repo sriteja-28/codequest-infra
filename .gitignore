@@ -1,0 +1,26 @@
+# secrets
+.env*
+*.tfvars
+*.pem
+*.key
+
+*.tar
+*.image
+docker-compose.override.yml
+
+# terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+
+# kubernetes local
+.kube/
+
+# logs
+*.log
+
+# volumes
+*.volume
+
+# os files
+.DS_Store
