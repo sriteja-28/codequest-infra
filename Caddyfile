@@ -1,0 +1,52 @@
+# CodeQuest reverse proxy (Caddy 2).
+#
+# Site address comes from CQ_DOMAIN in infra/.env.production. For a public
+# domain Caddy obtains and renews Let's Encrypt certificates automatically
+# (needs ports 80+443 reachable and DNS pointing at the server); for
+# CQ_DOMAIN=localhost it issues a local certificate (browser shows one warning).
+#
+# Routes (same design as dev, minus the Next.js rewrite hop):
+#   /static/*        Django admin static files, served straight from a volume
+#   /api/*           Django (uvicorn, HTTP)
+#   /django-admin/*  Django
+#   /ws/*            Django (WebSocket — proxied transparently)
+#   everything else  Next.js standalone server
+#
+# /media/ is not routed: the platform has no uploads yet. If a feature starts
+# using MEDIA_ROOT, serve it from a shared volume the same way as /static/.
+
+{$CQ_DOMAIN} {
+	encode zstd gzip
+
+	# handle_path strips the /static prefix first: /static/admin/x resolves to
+	# /srv/static/admin/x. Plain `handle` keeps the full URI, so root + path
+	# would double the prefix (/srv/static/static/... → 404).
+	handle_path /static/* {
+		root * /srv/static
+		file_server
+	}
+
+	handle /api/* {
+		reverse_proxy backend:8000
+	}
+
+	handle /django-admin/* {
+		reverse_proxy backend:8000
+	}
+
+	handle /ws/* {
+		reverse_proxy backend:8000
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10mb
+			roll_keep 5
+			roll_keep_for 720h
+		}
+	}
+}

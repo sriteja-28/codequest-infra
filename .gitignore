@@ -24,3 +24,6 @@ docker-compose.override.yml
 
 # os files
 .DS_Store
+# env templates are documentation and must be committed
+!.env.example
+!*.env.example

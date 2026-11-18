@@ -1,0 +1,231 @@
+# CodeQuest production stack.
+#
+#   cd infra
+#   cp .env.production.example .env.production      # then fill in the values
+#   docker compose --env-file .env.production -f docker-compose.prod.yml build
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d
+#
+# One env file (infra/.env.production) drives everything: compose variable
+# interpolation for the infra services AND the backend/judge process env.
+# The frontend builds with empty NEXT_PUBLIC_* values (same-origin /api + /ws).
+#
+# Topology (single bridge network, only Caddy is reachable):
+#
+#   browser ── 80/443 ── Caddy ─┬─ /api, /django-admin, /ws, /static ── backend (uvicorn)
+#                               └─ everything else ──────────────────── frontend (Next standalone)
+#   backend ── Postgres / Redis / RabbitMQ (internal only)
+#   worker  ── RabbitMQ jobs ── runs code in Docker via the host's socket
+#   finalizer ── runs `finalize_contests` every minute
+#
+# Volumes are prefixed codequest-prod_* by the project name, so this never
+# touches the codequest-dev development volumes.
+name: codequest-prod
+
+# The backend, migrate and finalizer services share one image: only `backend`
+# has the `build:` key, the other two run the built image directly.
+x-backend-build: &backend-build
+  context: ../backend
+  dockerfile: Dockerfile
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: codequest
+      POSTGRES_USER: codequest
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in infra/.env.production}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codequest -d codequest"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    # No host ports: reach it with `docker compose ... exec postgres psql ...`.
+
+  redis:
+    image: redis:7-alpine
+    # Small AOF so cache-backed sessions survive a restart; the cache itself
+    # is rebuilt on demand. No auth: the network is internal-only.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "512mb", "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-codequest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in infra/.env.production}
+    volumes:
+      - rabbitmq:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+    restart: unless-stopped
+    # Management UI is not published. If you need it, open an SSH tunnel:
+    #   ssh -L 15672:127.0.0.1:15672 <server>   then add a publish for 15672.
+
+  # One-shot: schema migrations + admin static files for Caddy to serve.
+  migrate:
+    image: codequest-backend
+    command: ["sh", "-c", "python manage.py migrate --noinput && python manage.py collectstatic --noinput"]
+    env_file:
+      - .env.production
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.production
+    volumes:
+      - backend_static:/app/staticfiles
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: "no"
+    # One-shot without a server: the image's HTTP healthcheck must not apply.
+    healthcheck:
+      disable: true
+
+  backend:
+    build: *backend-build
+    image: codequest-backend
+    env_file:
+      - .env.production
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # No host ports: Caddy reaches it over the internal network.
+
+  judge-worker:
+    build:
+      context: ../judge
+      dockerfile: Dockerfile
+    image: codequest-worker
+    env_file:
+      - .env.production
+    # The sandbox executes user code in Docker containers that must exist on
+    # the daemon this socket points at; root is used because socket group IDs
+    # differ per host (see judge/Dockerfile).
+    user: root
+    environment:
+      # Each run's payload dir is bind-mounted into the language containers,
+      # and the Docker daemon resolves those bind sources on the HOST — so
+      # the path must exist on the host, not only in this container. This
+      # matches the left side of the volume below (SANDBOX_DIR in the env
+      # file overrides both on Docker Desktop for Windows).
+      SANDBOX_DIR: ${SANDBOX_DIR:-/var/lib/codequest/sandbox}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Host-visible payload dir at the SAME path (defaults are for a Linux
+      # server; Docker Desktop values are documented in .env.production.example).
+      - ${SANDBOX_HOST_DIR:-/var/lib/codequest/sandbox}:${SANDBOX_DIR:-/var/lib/codequest/sandbox}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  # Idempotent contest finalizer; matches the docs' "run it periodically" note
+  # so no host cron is required.
+  finalizer:
+    image: codequest-backend
+    command: ["sh", "-c", "while :; do sleep 60; python manage.py finalize_contests || true; done"]
+    env_file:
+      - .env.production
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # Loop service without a server: the image's HTTP healthcheck must not
+    # apply (it would report unhealthy forever).
+    healthcheck:
+      disable: true
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
+    image: codequest-frontend
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+    # No host ports: Caddy reaches it over the internal network.
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      CQ_DOMAIN: ${CQ_DOMAIN:?set CQ_DOMAIN in infra/.env.production}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - backend_static:/srv/static:ro
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+    restart: unless-stopped
+
+  # Build-only helpers for the judge sandbox images (never run):
+  #   docker compose --env-file .env.production -f docker-compose.prod.yml --profile images build
+  # They must exist on the daemon the worker's Docker socket points at
+  # (equivalently: docker build -t codequest-python judge/languages/python).
+  judge-image-python:
+    image: codequest-python
+    build: ../judge/languages/python
+    profiles: ["images"]
+    restart: "no"
+  judge-image-cpp:
+    image: codequest-cpp
+    build: ../judge/languages/cpp
+    profiles: ["images"]
+    restart: "no"
+  judge-image-java:
+    image: codequest-java
+    build: ../judge/languages/java
+    profiles: ["images"]
+    restart: "no"
+  judge-image-js:
+    image: codequest-js
+    build: ../judge/languages/javascript
+    profiles: ["images"]
+    restart: "no"
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitmq:
+  backend_static:
+  caddy_data:
+  caddy_config:

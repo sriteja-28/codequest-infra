@@ -1,0 +1,74 @@
+# CodeQuest local development infrastructure (Postgres, Redis, RabbitMQ only).
+#
+# The app processes (Django API, judge worker, Next.js) run on the host so code
+# reloads instantly; see scripts/dev.ps1 (Windows) or scripts/dev.sh (macOS/Linux).
+#
+#   docker compose -f infra/docker-compose.dev.yml up -d
+#
+# Ports are deliberately NOT the defaults (5432/6379/5672), so this stack can
+# run next to databases you already have on this machine. Everything binds to
+# 127.0.0.1 only: nothing is reachable from your network.
+#
+#   Postgres   127.0.0.1:5433   db/user codequest, password codequest_dev
+#   Redis      127.0.0.1:6380
+#   RabbitMQ   127.0.0.1:5673   user codequest, password codequest_dev
+#   RabbitMQ UI http://localhost:15673
+#
+# Data lives in the named volumes below (project "codequest-dev"). Wipe it with
+# `scripts/dev.ps1 reset-data` (asks for confirmation); `stop` keeps it.
+# These are development-only credentials; production uses infra/docker-compose.prod.yml.
+
+name: codequest-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: codequest
+      POSTGRES_USER: codequest
+      POSTGRES_PASSWORD: codequest_dev
+    ports:
+      - "127.0.0.1:${CQ_DEV_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codequest -d codequest"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Dev stack only runs while you develop: no auto-start after a reboot.
+    restart: "no"
+
+  redis:
+    image: redis:7-alpine
+    # Dev only: no persistence, small memory cap (cache + Channels + sessions).
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "volatile-lru"]
+    ports:
+      - "127.0.0.1:${CQ_DEV_REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: "no"
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: codequest
+      RABBITMQ_DEFAULT_PASS: codequest_dev
+    ports:
+      - "127.0.0.1:${CQ_DEV_RABBITMQ_PORT:-5673}:5672"
+      - "127.0.0.1:${CQ_DEV_RABBITMQ_UI_PORT:-15673}:15672"
+    volumes:
+      - rabbitmq:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    restart: "no"
+
+volumes:
+  pgdata:
+  rabbitmq:
